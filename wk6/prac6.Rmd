@@ -4,4 +4,189 @@ author: "Lingshan Li"
 date: '2022-12-14'
 output: html_document
 ---
+Title: Detecting spatial patterns
+
+Question: For any given London Borough, are the Blue Plaques within that borough distributed randomly or do they exhibit some kind of dispersed or clustered pattern?
+
+# 1. Loading Library
+```{r}
+#first library a few packages that we will use during the practical
+#note you may need to install them first...
+library(spatstat) # Point Pattern Analysis functions
+library(here)
+library(sp)
+library(rgeos)
+library(maptools)
+library(tmap)
+library(sf)
+library(geojson)
+library(geojsonio)
+library(tmaptools)
+
+library(stringr)
+
+library(tidyverse)
+library(sf)
+```
+
+
+# 2. Setting up data
+```{r}
+##First, get the London Borough Boundaries
+LondonBoroughs <- st_read(here::here("Prac1_data",
+                                     "statistical-gis-boundaries-london",
+                                     "ESRI",
+                                     "London_Borough_Excluding_MHW.shp"))
+# Or use this to read in directly.
+#LondonBoroughs <- st_read("https://opendata.arcgis.com/datasets/8edafbe3276d4b56aec60991cbddda50_4.geojson")
+```
+
+```{r}
+library(stringr)
+BoroughMap <- LondonBoroughs %>%
+  dplyr::filter(str_detect(GSS_CODE, "^E09"))%>%
+  st_transform(., 27700)
+
+qtm(BoroughMap)
+```
+```{r}
+summary(BoroughMap)
+```
+
+```{r}
+## Secondly, get the location of all Blue Plaques in the City
+BluePlaques <- st_read(here::here("Prac6_data",
+                              "open-plaques-london-2018-04-08.geojson"))%>%
+  st_transform(.,27700)
+#Or
+#BluePlaques <- st_read("https://s3.eu-west-2.amazonaws.com/openplaques/open-plaques-london-2018-04-08.geojson")
+```
+```{r}
+summary(BluePlaques)
+```
+
+```{r}
+#plot the blue plaques in the city
+tmap_mode("plot")
+tm_shape(BoroughMap) +
+  tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(BluePlaques) +
+  tm_dots(col = "blue")
+```
+## 2.1 Data cleaning
+There is at least one Blue Plaque that falls outside of the Borough boundaries. Errant plaques will cause problems with our analysis, so we need to clip the plaques to the boundaries
+```{r}
+# First remove any Plaques with the same grid reference as this will cause problems later on in the analysis
+#remove duplicates
+library(tidyverse)
+
+library(sf)
+BluePlaques <- distinct(BluePlaques)
+```
+
+## 2.2 Spatial Subsetting
+Now just select the points inside London
+```{r}
+BluePlaquesSub <- BluePlaques[BoroughMap,]
+#check to see that they've been removed
+tmap_mode("plot")
+tm_shape(BoroughMap) +
+  tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(BluePlaquesSub) +
+  tm_dots(col = "blue")
+```
+
+```{r}
+# add sparse稀疏的=false to get the complete matrix.
+intersect_indices <-st_intersects(BoroughMap, BluePlaques)
+```
+
+## 2.3 Spatial clipping剪切
+
+## 2.4 Spatial Joining
+```{r}
+Londonborough <- st_read(here::here("Prac1_data",
+                                    "statistical-gis-boundaries-london", 
+                                    "ESRI", 
+                                    "London_Borough_Excluding_MHW.shp"))%>%
+  st_transform(., 27700)
+
+nrow(Londonborough)
+```
+```{r}
+OSM <- st_read(here::here("prac5_data",
+                          "greater-london-latest-free.shp", 
+                          "gis_osm_pois_a_free_1.shp")) %>%
+  st_transform(., 27700) %>%
+  #select hotels only
+  filter(fclass == 'hotel')
+
+nrow(OSM)
+```
+```{r}
+join_example <-  st_join(OSM, Londonborough)
+
+nrow(join_example)
+```
+```{r}
+# read in the .csv
+# and make it into spatial data
+
+Airbnb <- read_csv("prac5_data/listings.csv") %>%
+  st_as_sf(., coords = c("longitude", "latitude"), 
+                   crs = 4326) %>%
+    st_transform(., 27700)%>%
+    #select entire places that are available all year
+    filter(room_type == 'Entire home/apt' & availability_365 =='365')
+
+
+# make a function for the join
+# functions are covered in practical 7
+# but see if you can work out what is going on
+# hint all you have to do is replace data1 and data2
+# with the data you want to use
+
+Joinfun <- function(data1, data2){
+
+output<- data1%>%
+  st_join(Londonborough,.) %>%
+  add_count(GSS_CODE, name="hotels_in_borough") 
+
+  return(output)
+}
+
+# use the function for hotels
+Hotels <- Joinfun(OSM, Londonborough)
+
+# then for airbnb
+Airbnb <- Joinfun(Airbnb, Londonborough)
+ 
+Hotels <- Hotels %>%
+  #at the moment each hotel is a row for the borough
+  #we just one one row that has number of airbnbs
+  group_by(., GSS_CODE, NAME)%>%
+  summarise(`Accomodation count` = unique(hotels_in_borough))
+# Hotels: sf object = hotels per borough
+
+Airbnb <- Airbnb %>%
+  group_by(., GSS_CODE, NAME)%>%
+  summarise(`Accomodation count` = unique(hotels_in_borough))
+# Airbnb: sf object = airbnbs per borough
+```
+```{r}
+# left_join() don't work with spatial data
+all_accomodation <- st_join(Hotels, Airbnb)
+
+head(all_accomodation)
+```
+st_join is a left join, here the left table is hotels
+st_join uses st_intersects() by default. This means for the hotel data, where the airbnb intersects each hotel borough a new row is added. 
+To further explain this open the all_accomodation and look at the .y columns, any borough that intersects another is added as a row.
+To rectify this we can change the argument to st_equals() that returns the data based on the same geometries (or polygons)….
+```{r}
+all_accomodation <- st_join(Hotels, Airbnb, join = st_equals)
+
+head(all_accomodation)
+```
+
 
